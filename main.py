@@ -824,22 +824,25 @@ Write the full runnable Python code below.
 
     final_prompt = f"""
 You are given:
-- The full list of questions: {json.dumps(questions, indent=2)}
-- The partial/collected answers for batches (one string per batch), in order:
-{json.dumps(collected_answers, indent=2)}
-- other_info: \"\"\"{other_info}\"\"\" 
-- The required final response format: {response_format}
+- Full list of questions: {json.dumps(questions, indent=2)}
+- Partial/collected answers for each batch (in order): {json.dumps(collected_answers, indent=2)}
+- Other info: \"\"\"{other_info}\"\"\"
+- Required final response format: {response_format}
 
-Your task:
-Return the final answer strictly in the requested response format. For example, if response_format says "JSON array of strings",
-return a JSON array of strings. If it says "JSON object with keys ...", return a JSON object matching that schema.
+Task:
+Combine the partial answers into a single final answer that strictly matches the required response format.
 
+Note:If they say json array of string follow json array (point no 2 in rules)
 Rules:
-- Return ONLY the final answer in the exact format. No surrounding markdown, comments, or extra text.
-- If you cannot compute some answer, substitute reasonable placeholders from the provided partial answers.
-- Ensure the final output is valid JSON when response_format implies JSON.
+1. Output must be in the exact format described by `response_format` (e.g. JSON array, JSON object).
+2. If the format requires a JSON array:
+   - Use integers for numbers.
+   - Use strings for text.
+3. If some answers are missing, fill with reasonable placeholders from partial answers.
+4. Do not add any explanations, markdown, or extra text.
+5. Ensure the output is valid JSON whenever `response_format` implies JSON.
 
-Produce the final output now.
+Return only the final answer.
 """
     print("Requesting final formatting from Gemini...")
     final_response = gemini_model.generate_content([{"text": final_prompt}])
