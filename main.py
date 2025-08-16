@@ -207,57 +207,72 @@ def extract_first_balanced_json(s: str) -> Optional[str]:
     # ran out of string without closing all opened brackets
     return None
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 def extract_structure_data(uploaded_files: List[str]) -> Dict[str, Any]:
-    """
-    Build a lightweight structure dict mapping filepath -> content.
-    For CSV/PDF/DB/Parquet we call small preview handlers that return:
-      {"success": True/False, "content": "<string preview>"}
-    For images we call tools.get_image.get_image(filepath) (string).
-    For json/jsonl call tools.get_json.inspect_json_file(filepath).
-    For other text files we read raw text (but avoid huge files).
-    """
-    structure = {}
-    question_names = {"question.txt", "questions.txt", "question", "questions"}
+            """
+            Build a lightweight structure dict mapping filepath -> content.
+            For CSV/PDF/DB/Parquet we call small preview handlers that return:
+              {"success": True/False, "content": "<string preview>"}
+            For images we call tools.get_image.get_image(filepath) (string).
+            For json/jsonl call tools.get_json.inspect_json_file(filepath).
+            For other text files we read raw text (but avoid huge files).
+            Uses ThreadPoolExecutor to parallelize file processing for efficiency.
+            """
+            structure: Dict[str, Any] = {}
+            question_names = {"question.txt", "questions.txt", "question", "questions"}
 
-    for filepath in uploaded_files:
-        base_name = os.path.basename(filepath).lower()
-        if base_name in question_names:
-            # skip question files
-            continue
+            def process_file(filepath: str) -> tuple[str, Any]:
+                """
+                Process a single file and return (filepath, content) tuple.
+                Uses streaming for large files and robust error handling.
+                """
+                base_name = os.path.basename(filepath).lower()
+                if base_name in question_names:
+                    return (filepath, None)
 
-        ftype = describe_file(filepath)
-        try:
-            if ftype == "csv":
-                content = tools.read_csv.read_csv_preview(filepath)
-            elif ftype == "pdf":
-                content = tools.read_pdf.read_pdf_preview(filepath)
-            elif ftype == "parquet":
-                content = tools.read_parquet.read_parquet_preview(filepath)
-            elif ftype == "db":
-                content = tools.read_sqlite.read_sqlite_preview(filepath)
-            elif ftype == "image":
-                # tools.get_image returns a description string
-                content = tools.get_image.get_image(filepath)
-            elif ftype in {"json", "jsonl"}:
-                content = tools.get_json.inspect_json_file(filepath)
-            elif ftype in {"markdown", "text"}:
-                # small text read
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-            else:
-                # fallback: read small prefix only to avoid huge blobs
+                ftype = describe_file(filepath)
                 try:
-                    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                        content = f.read(2000)
-                except Exception:
-                    content = f"(Could not read file or unsupported binary): {os.path.basename(filepath)}"
-        except Exception as e:
-            content = {"success": False, "error": f"Error reading {ftype} file: {str(e)}"}
+                    if ftype == "csv":
+                        content = tools.read_csv.read_csv_preview(filepath)
+                    elif ftype == "pdf":
+                        content = tools.read_pdf.read_pdf_preview(filepath)
+                    elif ftype == "parquet":
+                        content = tools.read_parquet.read_parquet_preview(filepath)
+                    elif ftype == "db":
+                        content = tools.read_sqlite.read_sqlite_preview(filepath)
+                    elif ftype == "image":
+                        content = tools.get_image.get_image(filepath)
+                    elif ftype in {"json", "jsonl"}:
+                        content = tools.get_json.inspect_json_file(filepath)
+                    elif ftype in {"markdown", "text"}:
+                        # Stream read for large text files (up to 2000 chars)
+                        content = ""
+                        try:
+                            with open(filepath, "r", encoding="utf-8") as f:
+                                for chunk in iter(lambda: f.read(1024), ""):
+                                    content += chunk
+                                    if len(content) >= 2000:
+                                        content = content[:2000]
+                                        break
+                        except Exception as e:
+                            content = f"(Could not read file: {os.path.basename(filepath)}; {e})"
+                    else:
+                        content = generate_extractor_for_unknown(filepath)
+                except Exception as e:
+                    content = {"success": False, "error": f"Error reading {ftype} file: {str(e)}"}
+                return (filepath, content)
 
-        structure[filepath] = content
+            # Use ThreadPoolExecutor for parallel file processing
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                future_to_file = {executor.submit(process_file, fp): fp for fp in uploaded_files}
+                for future in as_completed(future_to_file):
+                    fp, content = future.result()
+                    if content is not None:
+                        structure[fp] = content
 
-    return structure
-
+            return structure
+        
 def make_session_dir():
     # Always use /tmp for ephemeral storage (writable on Render)
     base_dir = "/tmp"
@@ -628,6 +643,64 @@ async def process_questions_in_batches(
     example_structure_json = json.dumps(example_structure, indent=2, ensure_ascii=False)
     collected_answers = []
 
+
+    # helper: decide whether the run output counts as an error
+    def _is_error_output(raw_output: str, parsed_obj: Any) -> bool:
+        if not raw_output:
+            return True
+        low = raw_output.lower()
+        # indicative substrings that usually mean something failed
+        error_indicators = [
+            "traceback", "exception", "error", "not found", "out of bounds",
+            "could not", "couldn't", "parsererror", "parse error", "no such file",
+            "file not found"
+        ]
+        if any(tok in low for tok in error_indicators):
+            # If JSON parsed and appears to be a valid **answer** (e.g. numeric, plain strings),
+            # still check contents: a dict with 'error' key or lists of error strings -> error.
+            if parsed_obj is not None:
+                # dict with explicit 'error' key -> definitely error
+                if isinstance(parsed_obj, dict):
+                    for k in parsed_obj.keys():
+                        if str(k).lower() == "error":
+                            return True
+                    # if dict looks like an answer (has numeric values or non-error keys) treat as success
+                    # but if any value contains error-like text, mark as error
+                    for v in parsed_obj.values():
+                        if isinstance(v, str) and any(tok in v.lower() for tok in error_indicators):
+                            return True
+                    return False  # parsed dict looked non-errory
+                # list: if most elements are error-like, treat as error
+                if isinstance(parsed_obj, list):
+                    # if list is empty -> error
+                    if len(parsed_obj) == 0:
+                        return True
+                    # if every string item contains an indicator -> error
+                    all_err = True
+                    for it in parsed_obj:
+                        if isinstance(it, dict):
+                            # dict with 'error' key
+                            if any(str(k).lower() == "error" for k in it.keys()):
+                                continue
+                            # dict without error key -> treat as non-error
+                            all_err = False
+                            break
+                        if isinstance(it, str):
+                            if any(tok in it.lower() for tok in error_indicators):
+                                continue
+                            else:
+                                all_err = False
+                                break
+                        else:
+                            # a number / other type -> treat as non-error
+                            all_err = False
+                            break
+                    return all_err
+            # raw contains error-like text and parsed obj not convincing -> error
+            return True
+        # Raw contains none of indicators -> treat as success
+        return False
+
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
         print(f"Processing batch {i // batch_size + 1}: {batch}")
@@ -638,26 +711,29 @@ You are a Python programmer. You need to answer these questions:
 Questions:
 {json.dumps(batch, indent=2)}
 
-You have access to the following files on disk, with their absolute paths and types, and previews:
+You have access to the following uploaded files, with their absolute paths, types, and stored content/previews:
 
 {example_structure_json}
 
 Guidelines:
-- Read files directly from the file system by their absolute path.
-- For CSV files, use pandas.read_csv(filepath).
-- Do NOT expect any file content embedded as JSON strings.
+- Use the `content` field inside each file entry whenever available (CSV previews, markdown, PDF extracts,images).
+- Only fall back to reading from the absolute file path if `success` is False or if the preview is insufficient.
+- For CSV and Parquet previews, treat `content` as CSV text .
+- For Markdown/Text previews, treat `content` as plain text.
+- For PDF previews, treat `content` as extracted initla text from few pages.
+- For images, `content` will be txt file If required table u will need to extract table for answering questions.
 - Your script should print answers ONLY, nothing else.
 - You can import libraries as needed (pandas, numpy, matplotlib, etc).
 
-Example:
+Example (CSV with content available):
 
-import pandas as pd
-df = pd.read_csv("path/to/file.csv")
-# Your analysis code here
+import pandas as pd, io
+df = pd.read_csv(io.StringIO(instructure["data.csv"]["content"]))
 print([...])  # answers as JSON or list
 
 Write the full runnable Python code below.
 """
+
 
         attempt = 0
         success_for_batch = False
@@ -677,21 +753,52 @@ Write the full runnable Python code below.
             print("Generated Python code:\n", code)
             output = run_generated_code(code)
             last_output = output
+
+            # If the harness reports a clear execution failure marker, treat as an execution error
             if output.startswith("❌ Error while executing"):
-                print(f"  Execution error: attempt {attempt} failed.")
+                print(f"  Execution harness error: attempt {attempt} failed.")
                 time.sleep(retry_backoff)
                 continue
+
+            # Try to parse JSON (first balanced substring then whole output)
+            parsed = None
+            try:
+                candidate = extract_first_balanced_json(output)
+                if candidate:
+                    parsed = json.loads(candidate)
+                else:
+                    # try whole output as JSON
+                    parsed = json.loads(output)
+            except Exception:
+                parsed = None
+
+            # Decide if output looks like an error
+            if _is_error_output(output, parsed):
+                print(f"  Execution produced an error-like output (attempt {attempt}). Raw output: {output[:400]}")
+                # If we still have attempts left, retry after backoff
+                if attempt < max_attempts:
+                    time.sleep(retry_backoff)
+                    continue
+                else:
+                    # final attempt also failed -> we'll fall through to placeholder logic below
+                    break
             else:
+                # Success: keep this output as the batch result
                 print(f"  Execution succeeded. Output:\n{output}")
+                # store the raw output (keep as-is so final formatter can consume it)
                 collected_answers.append({"batch": batch, "raw_output": output})
                 success_for_batch = True
+                break  # exit attempts loop
 
+        # If we exhausted attempts or output was error-like and we didn't succeed, use placeholders
         if not success_for_batch:
             print("  All attempts failed for this batch — using placeholders.")
             placeholders = []
             for q in batch:
                 placeholders.append(placeholder_for_format(q, response_format))
             collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
+            # Also log the last raw output for diagnostics
+            print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
 
     final_prompt = f"""
 You are given:
@@ -796,7 +903,7 @@ async def handle_files(request: Request):
         session_dir=session_dir,
         uploaded_files=uploaded_files,
         batch_size=2,
-        max_attempts=3,
+        max_attempts=2,
         retry_backoff=1.0
     )
 
