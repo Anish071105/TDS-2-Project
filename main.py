@@ -8,6 +8,7 @@ import json
 import re
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai  # Make sure installed
+from openai import OpenAI
 import asyncio
 from pathlib import Path
 import mimetypes
@@ -459,6 +460,7 @@ Questions:
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel("gemini-2.0-flash")
 
+    
     response = model.generate_content([{"text": prompt}])
     css_selector = response.text.strip()
 
@@ -594,20 +596,20 @@ async def process_questions_in_batches(
     """
 
     # Use OpenAI API for code generation (AIPIPE proxy) for code-writing prompt only
-    import openai
-    import google.generativeai as genai
-    openai_api_key = os.getenv("AIPIPE_TOKEN") or os.getenv("OPENAI_API_KEY")
-    openai_base_url = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openai/v1")
-    if not openai_api_key:
-        raise RuntimeError("AIPIPE_TOKEN or OPENAI_API_KEY environment variable not set")
-    openai.api_key = openai_api_key
-    openai.api_base = openai_base_url
+    
     gemini_api_key = os.getenv("GOOGLE_API_KEY")
     if not gemini_api_key:
         raise RuntimeError("GOOGLE_API_KEY environment variable not set")
     genai.configure(api_key=gemini_api_key)
     gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
+    openai_api_key = os.getenv("AIPIPE_TOKEN") or os.getenv("OPENAI_API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openai/v1")
+    if not openai_api_key:
+      raise RuntimeError("AIPIPE_TOKEN or OPENAI_API_KEY environment variable not set")
+
+    client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
+ 
     questions: List[str] = extracted.get("questions", [])
     other_info: str = extracted.get("other_info", "")
     response_format: Optional[str] = extracted.get("response_format")
@@ -759,7 +761,7 @@ Write the full runnable Python code below.
                     temperature=0.2,
                     max_tokens=1800,
                 )
-                code = response["choices"][0]["message"]["content"].strip()
+                code = response.choices[0].message.content.strip()
             except Exception as e:
                 print(f"  OpenAI API error: {e}")
                 time.sleep(retry_backoff)
