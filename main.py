@@ -593,11 +593,20 @@ async def process_questions_in_batches(
     - Then ask Gemini to format final answers according to response_format.
     """
 
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
+    # Use OpenAI API for code generation (AIPIPE proxy) for code-writing prompt only
+    import openai
+    import google.generativeai as genai
+    openai_api_key = os.getenv("AIPIPE_TOKEN") or os.getenv("OPENAI_API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openai/v1")
+    if not openai_api_key:
+        raise RuntimeError("AIPIPE_TOKEN or OPENAI_API_KEY environment variable not set")
+    openai.api_key = openai_api_key
+    openai.api_base = openai_base_url
+    gemini_api_key = os.getenv("GOOGLE_API_KEY")
+    if not gemini_api_key:
         raise RuntimeError("GOOGLE_API_KEY environment variable not set")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    genai.configure(api_key=gemini_api_key)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
     questions: List[str] = extracted.get("questions", [])
     other_info: str = extracted.get("other_info", "")
@@ -725,10 +734,11 @@ Guidelines:
 - Your script should print answers ONLY, nothing else.
 - You can import libraries as needed (pandas, numpy, matplotlib, etc).
 
-Example (CSV with content available):
+Example:
 
-import pandas as pd, io
-df = pd.read_csv(io.StringIO(instructure["data.csv"]["content"]))
+import pandas as pd
+df = pd.read_csv("path/to/file.csv")
+# Your analysis code here
 print([...])  # answers as JSON or list
 
 Write the full runnable Python code below.
@@ -742,8 +752,18 @@ Write the full runnable Python code below.
         while attempt < max_attempts and not success_for_batch:
             attempt += 1
             print(f"  Generating code (attempt {attempt}/{max_attempts})...")
-            response = model.generate_content([{"text": prompt}])
-            code = response.text.strip()
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                    max_tokens=1800,
+                )
+                code = response["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                print(f"  OpenAI API error: {e}")
+                time.sleep(retry_backoff)
+                continue
 
             # strip code fences if present
             if code.startswith("```"):
@@ -820,7 +840,7 @@ Rules:
 Produce the final output now.
 """
     print("Requesting final formatting from Gemini...")
-    final_response = model.generate_content([{"text": final_prompt}])
+    final_response = gemini_model.generate_content([{"text": final_prompt}])
     final_text = final_response.text.strip()
     final_text_extracted = extract_json_from_markdown(final_text)
     try:
