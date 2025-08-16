@@ -11,17 +11,25 @@ RUN apt-get update && apt-get install -y \
     libsecret-1-0 \
     libmanette-0.2-0 \
     libgles2 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements.txt and install Python packages including playwright
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8000
+
+# Copy requirements and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers and dependencies
+# Install Playwright browsers
 RUN playwright install --with-deps
 
 # Copy app source code
 COPY . .
 
-# Run your app
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Expose port
+EXPOSE 8000
+
+# Run the app with exec form to ensure signals are handled correctly
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--loop", "asyncio"]
