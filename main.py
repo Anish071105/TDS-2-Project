@@ -148,6 +148,66 @@ Write the full Python script now.
     return {"success": False, "error": f"Extractor did not emit valid JSON. RawOutput: {snippet}"}
 
 
+def extract_first_balanced_json(s: str) -> Optional[str]:
+    """
+    Find and return the first balanced JSON substring (object or array) in s,
+    or None if none found.
+
+    Handles nested {} and [] and ignores braces that appear inside JSON strings.
+    """
+    if not s:
+        return None
+
+    # find first opening bracket for object/array
+    start = None
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+
+    stack = []
+    in_str = False
+    esc = False
+
+    for i in range(start, len(s)):
+        ch = s[i]
+
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            # inside string -> ignore other chars
+            continue
+
+        # not in string
+        if ch == '"':
+            in_str = True
+            continue
+
+        if ch in "{[":
+            stack.append(ch)
+            continue
+
+        if ch in "}]":
+            if not stack:
+                # closing without opening — malformed
+                return None
+            opener = stack.pop()
+            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
+                # mismatched pair
+                return None
+            if not stack:
+                # balanced block complete
+                return s[start : i + 1]
+
+    # ran out of string without closing all opened brackets
+    return None
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def extract_structure_data(uploaded_files: List[str]) -> Dict[str, Any]:
@@ -236,21 +296,6 @@ def extract_json_from_markdown(text: str) -> str:
 
     return text.strip()
 
-def extract_first_balanced_json(text: str) -> Optional[str]:
-    stack = []
-    start_idx = None
-    for i, c in enumerate(text):
-        if c in "{[":
-            if start_idx is None:
-                start_idx = i
-            stack.append(c)
-        elif c in "}]":
-            if stack:
-                stack.pop()
-                if not stack and start_idx is not None:
-                    return text[start_idx:i+1]
-    return None
-
 def extract_keys_from_instructions(text: str) -> Optional[Dict[str, str]]:
     matches = re.findall(r"-\s*`(\w+)`\s*:\s*(.+)", text)
     if matches:
@@ -266,113 +311,188 @@ def extract_keys_from_instructions(text: str) -> Optional[Dict[str, str]]:
         return result
     return None
 
-def heuristic_extract_url(text: str) -> Optional[str]:
-    m = re.search(r"https?://[^\s\)\]\}\'\"<>]+", text)
-    return m.group(0) if m else None
-
-def extract_questions_from_llm(content: str) -> List[str]:
-    """Ask Gemini to generate the actual list of questions the user wants answered."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY environment variable not set")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    content_escaped = json.dumps(content)
-    prompt = f"""
-You are an expert assistant. Read the following text and list all questions a user wants answered. 
-Return ONLY a JSON array of strings (the questions), no extra text.
-content = {content_escaped}
-"""
-    response = model.generate_content([{"text": prompt}])
-    raw = response.text
-    try:
-        candidate = extract_first_balanced_json(raw)
-        if candidate:
-            questions = json.loads(candidate)
-            if isinstance(questions, list):
-                return questions
-    except Exception:
-        pass
-    return []
-
-def extract_response_format_from_llm(content: str) -> Optional[object]:
-    """Ask Gemini to generate response_format (could be object, array, etc.)."""
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY environment variable not set")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-
-    content_escaped = json.dumps(content)
-    prompt = f"""
-You are an expert assistant. Read the following text and generate the response_format
-for answers. Return ONLY valid JSON (object or array) reflecting the expected answer types.
-content = {content_escaped}
-"""
-    response = model.generate_content([{"text": prompt}])
-    raw = response.text
-    try:
-        candidate = extract_first_balanced_json(raw)
-        if candidate:
-            return json.loads(candidate)
-    except Exception:
-        pass
-    return None
-
 def extract_from_questions(question_file_path: str) -> dict:
+    """
+    Robust extractor:
+      - Sends the question file to Gemini (but JSON-escapes the file text)
+      - Parses Gemini output using balanced-brace extraction
+      - If parsing fails, falls back to simple regex heuristics:
+         * find first http(s):// URL
+         * extract numbered or bullet questions
+      - Returns a dict with keys: url, questions, response_format, sources, other_info
+    """
     with open(question_file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    # Extract questions using LLM first
-    questions = extract_questions_from_llm(content)
-    if not questions:
-        # fallback heuristics
-        lines = content.splitlines()
-        questions = [ln.strip() for ln in lines if ln.strip().endswith("?")]
+    # quick local heuristics (used as fallback)
+    def heuristic_extract_url(text: str) -> Optional[str]:
+        m = re.search(r"https?://[^\s\)\]\}\'\"<>]+", text)
+        return m.group(0) if m else None
 
-    # Extract response_format using LLM first
-    response_format = extract_response_format_from_llm(content)
-    if response_format is None:
-        # fallback: check explicit keys in instructions
-        response_format = extract_keys_from_instructions(content)
-        # if still none, fallback heuristic array of "string"/"number" based on keywords
-        if response_format is None:
-            response_format = []
-            number_keywords = [
-                "how many", "total", "sum", "count", "median",
-                "average", "correlation", "max", "min", "percentage", "number", "rank", "score"
-            ]
-            for q in questions:
-                q_lower = q.lower()
-                if any(kw in q_lower for kw in number_keywords):
-                    response_format.append("number")
-                elif any(x in q_lower for x in ["plot", "image", "base64", "chart"]):
-                    response_format.append("string")
-                else:
-                    response_format.append("string")
+    def heuristic_extract_questions(text: str) -> List[str]:
+        lines = text.splitlines()
+        qs = []
 
-    parsed = {
-        "url": heuristic_extract_url(content),
-        "questions": questions,
-        "response_format": response_format,
-        "sources": None,
-        "other_info": None
-    }
+        # numbered lines like "1. Question..."
+        for ln in lines:
+            m = re.match(r"^\s*\d+\.\s*(.+\S)", ln)
+            if m:
+                qs.append(m.group(1).strip())
+
+        # bullets like "- Question" or "* Question"
+        if not qs:
+            for ln in lines:
+                m = re.match(r"^\s*[-\*\u2022]\s*(.+\S)", ln)
+                if m:
+                    qs.append(m.group(1).strip())
+
+        # fallback: look for lines that end with '?'
+        if not qs:
+            for ln in lines:
+                if ln.strip().endswith("?"):
+                    qs.append(ln.strip())
+
+        return qs
+    
+    
+    def infer_array_types_from_questions(questions: List[str]) -> List[str]:
+      number_keywords = [
+        "how many", "total", "sum", "count", "median",
+        "average", "correlation", "max", "min", "percentage", "number", "rank", "score"
+      ]
+      inferred = []
+      for q in questions:
+        q_lower = q.lower()
+        if any(kw in q_lower for kw in number_keywords):
+            inferred.append("number")
+        elif any(x in q_lower for x in ["plot", "image", "base64", "chart"]):
+            inferred.append("string")
+        else:
+            inferred.append("string")
+      return inferred
+
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY environment variable not set")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    # Embed the file content as an escaped JSON string to avoid breaking the prompt
+    content_escaped = json.dumps(content)
+
+    prompt = f"""Parse the following question file which is provided as a JSON-escaped string.
+
+You must return a JSON object with exactly the keys:
+"url", "questions", "response_format", "sources", "other_info".
+
+1) "url": a string or null
+2) "questions": an array of strings (each question)
+3)"response_format": 
+Rules for repsonse format:
+- If expected response is a JSON object or Json with keys , return a mapping with retianing the keys and expected field: {{"total_sales": "number", "top_region": "string", }}(For image consider "base64").
+- If response is an array, return types in order. ["string" , "number"]
+- Use "number" for numeric answers and "string" for text or base64 images.
+- If expected format is none of above think of something else.
+4)"sources": array of source names or null
+5) "other_info": any other short instructions or null
+
+Return ONLY raw JSON (no surrounding text).
+
+The content to parse is provided below as a JSON string variable:
+
+content = {content_escaped}
+"""
+
+    response = model.generate_content([{"text": prompt}])
+    raw = response.text
+
+    parsed = None
+    try:
+        candidate = extract_first_balanced_json(raw)
+        if candidate:
+            parsed = json.loads(candidate)
+    except Exception:
+        parsed = None
+
+    # If Gemini failed to produce usable JSON, fallback to heuristics
+    if not parsed:
+        print("Warning: Gemini produced non-parseable JSON. Falling back to heuristics.")
+        fallback_url = heuristic_extract_url(content)
+        fallback_questions = heuristic_extract_questions(content)
+        parsed = {
+            "url": fallback_url,
+            "questions": fallback_questions,
+            "response_format": None,
+            "sources": None,
+            "other_info": f"Gemini raw reply: {raw[:1000].replace(chr(10),' ')}"
+        }
+
+    # Normalize fields
+    parsed.setdefault("url", None)
+    parsed.setdefault("questions", [])
+    parsed.setdefault("response_format", None)
+    parsed.setdefault("sources", None)
+    parsed.setdefault("other_info", None)
+
+    # If parsed['url'] is null but we can find a URL via regex, inject it
+    if not parsed.get("url"):
+        heuristic_url = heuristic_extract_url(content)
+        if heuristic_url:
+            parsed["url"] = heuristic_url
+
     return parsed
 
-def placeholder_for_format(question_text: str, response_format: Optional[str]) -> Any:
+from typing import Any, Optional, Union
+
+def placeholder_for_format(question_text: str, response_format: Optional[Union[str, list, dict]]) -> Any:
     """
     Heuristic placeholder when we couldn't generate a real answer.
+    Handles string, list, and dict-based response formats.
     """
     if not response_format:
         return "Good"
-    rf = response_format.lower()
-    if "string" in rf or "text" in rf or "json array of strings" in rf:
+
+    # Case 1: dict schema
+    if isinstance(response_format, dict):
+        for key, spec in response_format.items():
+            # try fuzzy match question → key
+            if key.replace("_", " ").lower() in question_text.lower():
+                return placeholder_for_type(spec)
+        # fallback if no match
+        return {k: placeholder_for_type(v) for k, v in response_format.items()}
+
+    # Case 2: list of types (parallel to questions)
+    if isinstance(response_format, list):
+        # fallback: just use first type
+        if response_format:
+            return placeholder_for_type(response_format[0])
         return "Good"
-    if "number" in rf or "int" in rf or "integer" in rf or "float" in rf:
-        return 1
+
+    # Case 3: plain string
+    if isinstance(response_format, str):
+        return placeholder_for_type(response_format)
+
     return "Good"
+
+
+def placeholder_for_type(spec: Union[str, dict]) -> Any:
+    """Map type spec to dummy placeholder value."""
+    t = spec.get("type", "string") if isinstance(spec, dict) else spec
+
+    if not isinstance(t, str):
+        return "Good"
+
+    t = t.lower()
+    if "number" in t or "int" in t or "integer" in t or "float" in t:
+        return 1
+    if "string" in t or "text" in t:
+        if isinstance(spec, dict) and spec.get("format") == "base64":
+            return ""  # placeholder for base64 string
+        return "Good"
+    if "json" in t:
+        return []
+    return "Good"
+
 
 
 # Modify get_relevant_data call to pass session_dir and uploaded_files, no returns expected
@@ -801,6 +921,7 @@ Strict output rules:
 - Missing string values: "UNKNOWN"
 - Missing images/base64: "MISSING_BASE64"
 - The JSON must be the only text output, with no extra commentary.
+
 """
 
     print("Requesting final formatting from Gemini...")
