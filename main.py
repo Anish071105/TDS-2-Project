@@ -755,7 +755,8 @@ Write the full runnable Python code below.
             attempt += 1
             print(f"  Generating code (attempt {attempt}/{max_attempts})...")
             try:
-                response = client.ChatCompletion.create(
+                
+                response = client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.2,
