@@ -147,65 +147,70 @@ Write the full Python script now.
     snippet = exec_output.replace("\n", " ")[:1000]
     return {"success": False, "error": f"Extractor did not emit valid JSON. RawOutput: {snippet}"}
 
-
-def extract_first_balanced_json(s: str) -> Optional[str]:
+def extract_json_or_base64(text: str) -> dict:
     """
-    Find and return the first balanced JSON substring (object or array) in s,
-    or None if none found.
-
-    Handles nested {} and [] and ignores braces that appear inside JSON strings.
+    Try to extract the first balanced JSON block from text.
+    If that fails, try to extract a base64 string inside.
+    Returns a dict (parsed JSON or {"image_base64": "..."} or {"raw_output": text}).
     """
-    if not s:
-        return None
 
-    # find first opening bracket for object/array
+    # --- Step 1: Balanced JSON scan ---
     start = None
-    for i, ch in enumerate(s):
-        if ch in "{[":
-            start = i
-            break
-    if start is None:
-        return None
-
     stack = []
-    in_str = False
-    esc = False
-
-    for i in range(start, len(s)):
-        ch = s[i]
-
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            # inside string -> ignore other chars
-            continue
-
-        # not in string
-        if ch == '"':
-            in_str = True
-            continue
-
+    for i, ch in enumerate(text):
         if ch in "{[":
+            if not stack:
+                start = i
             stack.append(ch)
-            continue
-
-        if ch in "}]":
+        elif ch in "}]":
             if not stack:
-                # closing without opening — malformed
-                return None
-            opener = stack.pop()
-            if (opener == "{" and ch != "}") or (opener == "[" and ch != "]"):
-                # mismatched pair
-                return None
-            if not stack:
-                # balanced block complete
-                return s[start : i + 1]
+                continue
+            opening = stack.pop()
+            if (opening == "{" and ch != "}") or (opening == "[" and ch != "]"):
+                # mismatched brackets → reset
+                stack.clear()
+                start = None
+            elif not stack and start is not None:
+                candidate = text[start:i+1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return {"raw_output": candidate}
 
-    # ran out of string without closing all opened brackets
+    # --- Step 2: Regex fallback for base64 ---
+    # Look for a long base64-like string
+    b64_match = re.search(r'([A-Za-z0-9+/]{100,}={0,2})', text)
+    if b64_match:
+        return {"image_base64": b64_match.group(1)}
+
+    # --- Step 3: Nothing matched ---
+    return {"raw_output": text}
+
+def extract_first_balanced_json(text: str) -> str | None:
+    """
+    Extracts the first balanced JSON object/array from text.
+    Handles very long base64 strings without truncation.
+    Returns the JSON string if found, else None.
+    """
+    start = None
+    stack = []
+
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            if not stack:
+                start = i
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                continue
+            opening = stack.pop()
+            if (opening == "{" and ch != "}") or (opening == "[" and ch != "]"):
+                # mismatched brackets, reset
+                stack.clear()
+                start = None
+            elif not stack and start is not None:
+                return text[start:i+1]
+
     return None
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -389,7 +394,7 @@ You must return a JSON object with exactly the keys:
 2) "questions": an array of strings (each question)
 3)"response_format": 
 Rules for repsonse format:
-- If expected response is a JSON object or Json with keys , return a mapping with retianing the keys and expected field: {{"total_sales": "number", "top_region": "string", }}(For image consider "base64").
+- If expected response is a JSON object or Json with keys , return a mapping with retianing the keys and expected field: {{"total_sales": "number", "top_region": "string", }}(For image consider "string").
 - If response is an array, return types in order. ["string" , "number"]
 - Use "number" for numeric answers and "string" for text or base64 images.
 - If expected format is none of above think of something else.
@@ -793,7 +798,7 @@ async def process_questions_in_batches(
         print(f"Processing batch {i // batch_size + 1}: {batch}")
 
         prompt = f"""
-You are a Python programmer. You need to answer these questions:
+You are a Python programmer tasked with answering user questions using uploaded files.
 
 Questions:
 {json.dumps(batch, indent=2)}
@@ -802,22 +807,29 @@ You have access to the following uploaded files, with their absolute paths, type
 
 {example_structure_json}
 
-Guidelines:
-- Use the `content` field inside each file entry whenever available (CSV previews, markdown, PDF extracts,images).
-- Only fall back to reading from the absolute file path if `success` is False or if the preview is insufficient.
-- For CSV and Parquet previews, treat `content` as CSV text .
-- For Markdown/Text previews, treat `content` as plain text.
-- For PDF previews, treat `content` as extracted initla text from few pages.
-- For images, `content` will be txt file If required table u will need to extract table for answering questions.
-- Your script should print answers ONLY, nothing else.
-- You can import libraries as needed (pandas, numpy, matplotlib, etc).
+Guidelines for generating code:
+- The `content` field contains only a **small preview** (usually first 5 rows of CSV, or a text extract).
+- Use `content` ONLY to understand the **schema or structure** of the file.
+- When writing Python code, always load the **entire dataset from `filepath`** 
+  (e.g., `pd.read_csv(filepath)`), not from `content`.
+- Only if the file at `filepath` cannot be read, then fall back to using `content`.
+- For CSV/Parquet, always prefer `pd.read_csv(filepath)` or `pd.read_parquet(filepath)`.
+- For text/Markdown/PDFs, `content` can be used directly since it already contains extracted text.
+- For images, `content` will contain OCR text; use that for analysis.
+- ⚠️ Never use deprecated APIs like `pandas.Series.append`; instead, use modern alternatives like `pd.concat`.
+- The code must print **only the answers** (JSON, list, or plain text) — no debug, no explanations.
 
 Example:
 
+```python
 import pandas as pd
-df = pd.read_csv("path/to/file.csv")
-# Your analysis code here
-print([...])  # answers as JSON or list
+
+# Always load from filepath for full dataset
+df = pd.read_csv(file_entry["filepath"])
+
+# Perform analysis
+answers = [...]
+print(answers)
 
 Write the full runnable Python code below.
 """
@@ -1033,3 +1045,4 @@ async def root(request: Request):
 async def health():
     # Return a small JSON for GET; FastAPI will auto-handle HEAD
     return {"status": "ok"}
+
