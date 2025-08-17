@@ -901,15 +901,14 @@ Write the full runnable Python code below.
                 break  # exit attempts loop
 
         # If we exhausted attempts or output was error-like and we didn't succeed, use placeholders
-               if not success_for_batch:
-                 print("  All attempts failed for this batch — using placeholders.")
-                 placeholders = []
-                 for q in batch:
-                     placeholders.append(placeholder_for_format(q, response_format))
-                 collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
-                 # Also log the last raw output for diagnostics
-                 print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
-
+        if not success_for_batch:
+            print("  All attempts failed for this batch — using placeholders.")
+            placeholders = []
+            for q in batch:
+                placeholders.append(placeholder_for_format(q, response_format))
+            collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
+            # Also log the last raw output for diagnostics
+            print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
     # ----------------------------------------------------------------------
     # After finishing all batches, always assemble the final JSON
     # ----------------------------------------------------------------------
@@ -1051,4 +1050,3 @@ async def root(request: Request):
 async def health():
     # Return a small JSON for GET; FastAPI will auto-handle HEAD
     return {"status": "ok"}
-
