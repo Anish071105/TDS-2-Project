@@ -901,15 +901,19 @@ Write the full runnable Python code below.
                 break  # exit attempts loop
 
         # If we exhausted attempts or output was error-like and we didn't succeed, use placeholders
-        if not success_for_batch:
-            print("  All attempts failed for this batch — using placeholders.")
-            placeholders = []
-            for q in batch:
-                placeholders.append(placeholder_for_format(q, response_format))
-            collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
-            # Also log the last raw output for diagnostics
-            print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
-            final_prompt = f"""
+               if not success_for_batch:
+                 print("  All attempts failed for this batch — using placeholders.")
+                 placeholders = []
+                 for q in batch:
+                     placeholders.append(placeholder_for_format(q, response_format))
+                 collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
+                 # Also log the last raw output for diagnostics
+                 print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
+
+    # ----------------------------------------------------------------------
+    # After finishing all batches, always assemble the final JSON
+    # ----------------------------------------------------------------------
+    final_prompt = f"""
 You are a precise JSON assembler.
 
 Questions:
@@ -919,7 +923,7 @@ Partial/collected answers (each item is a batch with 'raw_output'):
 {json.dumps(collected_answers, indent=2)}
 
 Other info:
-\"\"\"{other_info}\"\"\"
+\"\"\"{other_info}\"\"\" 
 
 Required final response format:
 {json.dumps(response_format, indent=2)}
@@ -932,20 +936,22 @@ Strict output rules:
 - Missing numeric values: 0
 - Missing string values: "UNKNOWN"
 - Missing images/base64: "MISSING_BASE64"
+- If any base64 string would exceed 50,000 characters, replace it with "MISSING_BASE64".
 - The JSON must be the only text output, with no extra commentary.
-
 """
 
     print("Requesting final formatting from Gemini...")
     final_response = gemini_model.generate_content([{"text": final_prompt}])
     final_text = final_response.text.strip()
     final_text_extracted = extract_json_from_markdown(final_text)
+
     try:
         parsed_final = json.loads(final_text_extracted)
     except Exception:
-        parsed_final = final_text
+        parsed_final = final_text  # fallback for debug if still not JSON
 
     return parsed_final
+
 
 ### FastAPI endpoint #########################################################
 app.add_middleware(
