@@ -657,7 +657,6 @@ Questions:
     except Exception as e:
         print(f"Unexpected error during automatic tgak.csv cleaning step: {e}")
 
-
 async def process_questions_in_batches(
     extracted: Dict[str, Any],
     structure: Dict[str, Any],
@@ -673,11 +672,13 @@ async def process_questions_in_batches(
       consumes `structure` (passed as JSON in prompt) and answers the batch.
     - Run generated code via tools.answer_questions.run_generated_code()
     - Retry on failure, fallback to placeholders.
-    - Then ask Gemini to format final answers according to response_format.
+    - Then ask Gemini to format final answers according to response_format,
+      while preserving large base64 blobs by stripping them before prompt and restoring after.
     """
 
-    # Use OpenAI API for code generation (AIPIPE proxy) for code-writing prompt only
-    
+    # -------------------------
+    # Setup LLM clients
+    # -------------------------
     gemini_api_key = os.getenv("GOOGLE_API_KEY")
     if not gemini_api_key:
         raise RuntimeError("GOOGLE_API_KEY environment variable not set")
@@ -687,15 +688,20 @@ async def process_questions_in_batches(
     openai_api_key = os.getenv("AIPIPE_TOKEN") or os.getenv("OPENAI_API_KEY")
     openai_base_url = os.getenv("OPENAI_BASE_URL", "https://aipipe.org/openai/v1")
     if not openai_api_key:
-      raise RuntimeError("AIPIPE_TOKEN or OPENAI_API_KEY environment variable not set")
+        raise RuntimeError("AIPIPE_TOKEN or OPENAI_API_KEY environment variable not set")
 
     client = OpenAI(api_key=openai_api_key, base_url=openai_base_url)
- 
+
+    # -------------------------
+    # Inputs
+    # -------------------------
     questions: List[str] = extracted.get("questions", [])
     other_info: str = extracted.get("other_info", "")
     response_format: Optional[str] = extracted.get("response_format")
 
-    # Prepare example snippet of structure for prompt (show first 5 files with file path, type, preview)
+    # -------------------------
+    # Build small structure preview for the prompt
+    # -------------------------
     example_structure = []
     count = 0
     for fp, content in structure.items():
@@ -705,15 +711,12 @@ async def process_questions_in_batches(
         ftype = describe_file(fp)
         entry["type"] = ftype
         try:
-            # If handler returned a dict like {"success": True/False, "content": "..."}
             if isinstance(content, dict):
-                if content.get("success") and "content" in content and isinstance(content["content"], str):
+                if content.get("success") and isinstance(content.get("content"), str):
                     lines = content["content"].splitlines()
                     entry["preview"] = "\n".join(lines[:5])
                 else:
-                    # failed handler or no content
                     entry["preview_error"] = content.get("error", "No preview available")
-            # Plain string content (small text, JSON summary, or CSV string)
             elif isinstance(content, str):
                 if ftype in {"csv", "parquet", "db"}:
                     lines = content.splitlines()
@@ -728,53 +731,45 @@ async def process_questions_in_batches(
                 entry["content_summary"] = "N/A"
         except Exception as e:
             entry["content_summary"] = f"Error preparing preview: {e}"
-
         example_structure.append(entry)
         count += 1
 
     example_structure_json = json.dumps(example_structure, indent=2, ensure_ascii=False)
-    collected_answers = []
+    collected_answers: List[Dict[str, Any]] = []
 
+    # -------------------------
+    # Helpers
+    # -------------------------
+    BASE64_RE = re.compile(r'(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{200,}={0,2})(?![A-Za-z0-9+/=])')
+    BASE64_MAX_LEN = 50000  # cutoff for restoration (anything longer becomes "MISSING_BASE64")
 
-    # helper: decide whether the run output counts as an error
     def _is_error_output(raw_output: str, parsed_obj: Any) -> bool:
         if not raw_output:
             return True
         low = raw_output.lower()
-        # indicative substrings that usually mean something failed
         error_indicators = [
             "traceback", "exception", "error", "not found", "out of bounds",
             "could not", "couldn't", "parsererror", "parse error", "no such file",
             "file not found"
         ]
         if any(tok in low for tok in error_indicators):
-            # If JSON parsed and appears to be a valid **answer** (e.g. numeric, plain strings),
-            # still check contents: a dict with 'error' key or lists of error strings -> error.
             if parsed_obj is not None:
-                # dict with explicit 'error' key -> definitely error
                 if isinstance(parsed_obj, dict):
                     for k in parsed_obj.keys():
                         if str(k).lower() == "error":
                             return True
-                    # if dict looks like an answer (has numeric values or non-error keys) treat as success
-                    # but if any value contains error-like text, mark as error
                     for v in parsed_obj.values():
                         if isinstance(v, str) and any(tok in v.lower() for tok in error_indicators):
                             return True
-                    return False  # parsed dict looked non-errory
-                # list: if most elements are error-like, treat as error
+                    return False
                 if isinstance(parsed_obj, list):
-                    # if list is empty -> error
                     if len(parsed_obj) == 0:
                         return True
-                    # if every string item contains an indicator -> error
                     all_err = True
                     for it in parsed_obj:
                         if isinstance(it, dict):
-                            # dict with 'error' key
                             if any(str(k).lower() == "error" for k in it.keys()):
                                 continue
-                            # dict without error key -> treat as non-error
                             all_err = False
                             break
                         if isinstance(it, str):
@@ -784,15 +779,72 @@ async def process_questions_in_batches(
                                 all_err = False
                                 break
                         else:
-                            # a number / other type -> treat as non-error
                             all_err = False
                             break
                     return all_err
-            # raw contains error-like text and parsed obj not convincing -> error
             return True
-        # Raw contains none of indicators -> treat as success
         return False
 
+    def find_base64_blobs_in_text(text: str) -> List[str]:
+        blobs = []
+        for m in BASE64_RE.finditer(text):
+            s = m.group(1)
+            if len(s) % 4 == 0:
+                blobs.append(s)
+        return blobs
+
+    def strip_base64_in_text(text: str) -> str:
+        def _sub(m):
+            return "__KEEP_BASE64__"
+        return BASE64_RE.sub(_sub, text)
+
+    def strip_base64(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: strip_base64(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [strip_base64(v) for v in obj]
+        elif isinstance(obj, str):
+            if BASE64_RE.fullmatch(obj):
+                return "__KEEP_BASE64__"
+            return strip_base64_in_text(obj)
+        return obj
+
+    def extract_base64(obj: Any, blobs: Optional[List[str]] = None) -> List[str]:
+        if blobs is None:
+            blobs = []
+        if isinstance(obj, dict):
+            for v in obj.values():
+                extract_base64(v, blobs)
+        elif isinstance(obj, list):
+            for v in obj:
+                extract_base64(v, blobs)
+        elif isinstance(obj, str):
+            if BASE64_RE.fullmatch(obj):
+                blobs.append(obj)
+            else:
+                blobs.extend(find_base64_blobs_in_text(obj))
+        return blobs
+
+    def restore_base64(obj: Any, blobs_iter) -> Any:
+        if isinstance(obj, dict):
+            return {k: restore_base64(v, blobs_iter) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [restore_base64(v, blobs_iter) for v in obj]
+        elif isinstance(obj, str) and "__KEEP_BASE64__" in obj:
+            if obj == "__KEEP_BASE64__":  # pure placeholder
+                return next(blobs_iter)
+            parts = obj.split("__KEEP_BASE64__")
+            rebuilt = []
+            for idx, p in enumerate(parts):
+                rebuilt.append(p)
+                if idx < len(parts) - 1:
+                    rebuilt.append(next(blobs_iter))
+            return "".join(rebuilt)
+        return obj
+
+    # -------------------------
+    # Batch loop
+    # -------------------------
     for i in range(0, len(questions), batch_size):
         batch = questions[i:i + batch_size]
         print(f"Processing batch {i // batch_size + 1}: {batch}")
@@ -818,22 +870,7 @@ Guidelines for generating code:
 - For images, `content` will contain OCR text; use that for analysis.
 - ⚠️ Never use deprecated APIs like `pandas.Series.append`; instead, use modern alternatives like `pd.concat`.
 - The code must print **only the answers** (JSON, list, or plain text) — no debug, no explanations.
-
-Example:
-
-```python
-import pandas as pd
-
-# Always load from filepath for full dataset
-df = pd.read_csv(file_entry["filepath"])
-
-# Perform analysis
-answers = [...]
-print(answers)
-
-Write the full runnable Python code below.
 """
-
 
         attempt = 0
         success_for_batch = False
@@ -855,7 +892,6 @@ Write the full runnable Python code below.
                 time.sleep(retry_backoff)
                 continue
 
-            # strip code fences if present
             if code.startswith("```"):
                 code = re.sub(r"^```.*\n|```$", "", code).strip()
 
@@ -864,65 +900,93 @@ Write the full runnable Python code below.
             output = run_generated_code(code)
             last_output = output
 
-            # If the harness reports a clear execution failure marker, treat as an execution error
             if output.startswith("❌ Error while executing"):
                 print(f"  Execution harness error: attempt {attempt} failed.")
                 time.sleep(retry_backoff)
                 continue
 
-            # Try to parse JSON (first balanced substring then whole output)
             parsed = None
             try:
                 candidate = extract_first_balanced_json(output)
                 if candidate:
                     parsed = json.loads(candidate)
                 else:
-                    # try whole output as JSON
                     parsed = json.loads(output)
             except Exception:
                 parsed = None
 
-            # Decide if output looks like an error
             if _is_error_output(output, parsed):
                 print(f"  Execution produced an error-like output (attempt {attempt}). Raw output: {output[:400]}")
-                # If we still have attempts left, retry after backoff
                 if attempt < max_attempts:
                     time.sleep(retry_backoff)
                     continue
                 else:
-                    # final attempt also failed -> we'll fall through to placeholder logic below
                     break
             else:
-                # Success: keep this output as the batch result
                 print(f"  Execution succeeded. Output:\n{output}")
-                # store the raw output (keep as-is so final formatter can consume it)
-                collected_answers.append({"batch": batch, "raw_output": output})
+                safe_blobs = extract_base64(parsed) if parsed is not None else find_base64_blobs_in_text(output)
+                collected_answers.append({
+                    "batch": batch,
+                    "raw_output": output,
+                    "safe_blobs": safe_blobs,
+                })
                 success_for_batch = True
-                break  # exit attempts loop
+                break
 
-        # If we exhausted attempts or output was error-like and we didn't succeed, use placeholders
         if not success_for_batch:
             print("  All attempts failed for this batch — using placeholders.")
             placeholders = []
             for q in batch:
                 placeholders.append(placeholder_for_format(q, response_format))
-            collected_answers.append({"batch": batch, "raw_output": json.dumps(placeholders)})
-            # Also log the last raw output for diagnostics
+            collected_answers.append({
+                "batch": batch,
+                "raw_output": json.dumps(placeholders),
+                "safe_blobs": []
+            })
             print(f"  Last raw output (kept for debug): {last_output[:800] if last_output else 'None'}")
+
     # ----------------------------------------------------------------------
-    # After finishing all batches, always assemble the final JSON
+    # After finishing all batches, assemble the final JSON
     # ----------------------------------------------------------------------
+    stripped_collected = []
+    all_blobs: List[str] = []
+
+    for c in collected_answers:
+        raw = c.get("raw_output", "")
+        blobs_for_batch = c.get("safe_blobs", [])
+        all_blobs.extend(blobs_for_batch)
+
+        try:
+            parsed_raw = None
+            cand = extract_first_balanced_json(raw)
+            if cand:
+                parsed_raw = json.loads(cand)
+            else:
+                parsed_raw = json.loads(raw)
+        except Exception:
+            parsed_raw = None
+
+        if parsed_raw is not None:
+            stripped = strip_base64(parsed_raw)
+        else:
+            stripped = strip_base64_in_text(raw)
+
+        stripped_collected.append({
+            "batch": c.get("batch", []),
+            "raw_output": stripped
+        })
+
     final_prompt = f"""
 You are a precise JSON assembler.
 
 Questions:
 {json.dumps(questions, indent=2)}
 
-Partial/collected answers (each item is a batch with 'raw_output'):
-{json.dumps(collected_answers, indent=2)}
+Partial/collected answers (each item is a batch with 'raw_output' where base64 blobs are replaced by KEEP_BASE64):
+{json.dumps(stripped_collected, indent=2)}
 
 Other info:
-\"\"\"{other_info}\"\"\" 
+{other_info}
 
 Required final response format:
 {json.dumps(response_format, indent=2)}
@@ -935,7 +999,7 @@ Strict output rules:
 - Missing numeric values: 0
 - Missing string values: "UNKNOWN"
 - Missing images/base64: "MISSING_BASE64"
-- If any base64 string would exceed 50,000 characters, replace it with "MISSING_BASE64".
+- If any base64 string would exceed {BASE64_MAX_LEN} characters, replace it with "MISSING_BASE64".
 - The JSON must be the only text output, with no extra commentary.
 """
 
@@ -947,10 +1011,22 @@ Strict output rules:
     try:
         parsed_final = json.loads(final_text_extracted)
     except Exception:
-        parsed_final = final_text  # fallback for debug if still not JSON
+        parsed_final = final_text
 
-    return parsed_final
+    # --- Restore blobs after Gemini formatting ---
+    def safe_blob_iter(blobs: List[str]):
+        for b in blobs:
+            if isinstance(b, str) and len(b) > BASE64_MAX_LEN:
+                yield "MISSING_BASE64"
+            else:
+                yield b
 
+    if isinstance(parsed_final, (dict, list)):
+        final_with_blobs = restore_base64(parsed_final, iter(safe_blob_iter(all_blobs)))
+    else:
+        final_with_blobs = parsed_final
+
+    return final_with_blobs
 
 ### FastAPI endpoint #########################################################
 app.add_middleware(
@@ -1050,3 +1126,4 @@ async def root(request: Request):
 async def health():
     # Return a small JSON for GET; FastAPI will auto-handle HEAD
     return {"status": "ok"}
+
