@@ -917,7 +917,9 @@ Write the full runnable Python code below.
 
             if code.startswith("```"):
                 code = re.sub(r"^```.*\n|```$", "", code).strip()
-
+            print("  --- Generated Code ---")
+            print(code)
+            print("  ---------------------")
             print("  Executing generated code...")
             output = run_generated_code(code)
             last_output = output
